@@ -66,6 +66,8 @@ func main() {
 	//bufReader := bufio.NewReaderSize(rawReader, 100000000)
 	csvReader := yacr.DefaultReader(rawReader)
 
+	log.Printf("Settings are %v", csvReader.GetSettings())
+
 	//csvReader := csv.NewReader(bufReader)
 	//csvReader := csv.NewReader(rawReader)
 
@@ -73,12 +75,19 @@ func main() {
 	rNum := 0
 	for {
 		rNum++
-		_, err := csvReader.ScanRecord(&c1, &c2, &c3, &c4, &c5, &c6, &c7, &c8, &c9, &c10, &c11, &c12, &c13, &c14, &c15, &c16, &c17, &c18, &c19, &c20, &c21, &c22, &c23)
-		if err == io.EOF {
+		record, err := csvReader.ScanRecord(&c1, &c2, &c3, &c4, &c5, &c6, &c7, &c8, &c9, &c10, &c11, &c12, &c13, &c14, &c15, &c16, &c17, &c18, &c19, &c20, &c21, &c22, &c23)
+		//fmt.Printf("%v\t%v\t%v\t%v\n", c1, c2, c3, c4)
+		if rNum%1000 == 0 || record == 0 {
+			//log.Printf("Done with %d rows, columns=%d", rNum, record)
+		}
+
+		if err == io.EOF || record == 0 {
 			break
 		}
 		if err != nil {
 			log.Fatalf("Error in reading file at record %d, line %d: %v", rNum, csvReader.LineNumber(), err)
 		}
 	}
+	log.Printf("total rows = %d", rNum)
+
 }
