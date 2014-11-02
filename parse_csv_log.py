@@ -24,7 +24,7 @@ def main():
     rows = 0
     for record in csvReader:
         rows += 1
-        # print '\t'.join(record[0:3]) # access some fields are print something
+        # print '\t'.join(record[0:3]) # access some fields or print something
 
     print "total rows = %d" % rows
 
