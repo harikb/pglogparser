@@ -20,13 +20,16 @@ import (
 	"regexp"
 	"runtime"
 	"sync"
+	"time"
 )
 
 type cmdArgs struct {
-	cpuProfile  bool
-	memProfile  bool
-	logfilename string
-	numReaders  int32
+	cpuProfile        bool
+	memProfile        bool
+	canonicalizeQuery bool
+	tsv               bool
+	logfilename       string
+	numReaders        int32
 }
 
 // these are globals
@@ -40,39 +43,82 @@ type LogFile struct {
 	filename string
 }
 
+// TimeFormat is the format of query timestamp in postgresql csv log format
+var TimeFormat = "2006-01-02 15:04:05.000 MST"
+
+// TimeFormatNoMillis is the format of session timestamp in postgresql csv log format
+var TimeFormatNoMillis = "2006-01-02 15:04:05 MST"
+
+/*
+CsvLog is defined above. It mimics the format of postgresql table definition given above.
+From: http://www.postgresql.org/docs/9.4/static/runtime-config-logging.html
+
+CREATE TABLE postgres_log
+(
+  log_time timestamp(3) with time zone,
+  user_name text,
+  database_name text,
+  process_id integer,
+  connection_from text,
+  session_id text,
+  session_line_num bigint,
+  command_tag text,
+  session_start_time timestamp with time zone,
+  virtual_transaction_id text,
+  transaction_id bigint,
+  error_severity text,
+  sql_state_code text,
+  message text,
+  detail text,
+  hint text,
+  internal_query text,
+  internal_query_pos integer,
+  context text,
+  query text,
+  query_pos integer,
+  location text,
+  application_name text,
+  PRIMARY KEY (session_id, session_line_num)
+);
+
+*/
+type CsvLog struct {
+	logTime              time.Time
+	logTimeStr           []byte
+	userName             []byte
+	databaseName         []byte
+	processID            []byte
+	connectionFrom       []byte
+	sessionID            []byte
+	sessionLineNum       []byte
+	commandTag           []byte
+	sessionStartTime     time.Time
+	sessionStartTimeStr  []byte
+	virtualTransactionID []byte
+	transactionID        []byte
+	errorSeverity        []byte
+	sqlStateCode         []byte
+	message              []byte
+	detail               []byte
+	hint                 []byte
+	internalQuery        []byte
+	internalQueryPos     []byte
+	context              []byte
+	query                []byte
+	queryPos             []byte
+	location             []byte
+	applicationName      []byte
+}
+
 var fileChan chan LogFile
 
 func init() {
 
 	fileChan = make(chan LogFile)
 
-	/* A single quote followed by
-	// something that is either "not a single-quote or backslash" OR
-	// "backslash followed by some other non-empty character"
-	// followed by a single quote
-	*/
-
-	reValues = regexp.MustCompile(`'([^'\\]|\\.)*'`)
-	// tested here http://play.golang.org/p/oew9c4AfIS
-	// permalink: https://gist.github.com/harikb/3ed552d3996199f0208e
-
-	reComments = regexp.MustCompile(`--([^\n]*)\n`)
-
-	reMultiSpaces = regexp.MustCompile(`\s+`)
-
-	// Convert a list of literals  (?,?,?,?,?) to (?).
-	// Sometimes queries use variable number of arguments in an 'in' list
-
-	reMultiValues = regexp.MustCompile(`(\?|null|true|false|infinity)((,|\s|-)+(\?|null|true|false|infinity))+`)
-
-	reNumbers = regexp.MustCompile(`(\d+(\.\d+)?(e(\+|-)\d+)?)`)
-	// tested here http://play.golang.org/p/99qyocB8ij
-	// permalink: https://gist.github.com/harikb/eea68d55d72410df8066
-
 }
 
-func canonicalizeQuery2(query []byte) (canonicalQuery []byte, err error) {
-
+func canonicalizeQuery(query []byte) (canonicalQuery []byte, err error) {
 	inQuote := false
 	alreadySubed := false
 	inComment := false
@@ -170,49 +216,25 @@ func canonicalizeQuery2(query []byte) (canonicalQuery []byte, err error) {
 	return
 }
 
-func canonicalizeQuery(query []byte) []byte {
-
-	query = bytes.ToLower(query)
-	//log.Printf("Query is >%s<", string(query))
-	query = bytes.TrimRight(query, "; ")
-	//log.Printf("Query is >%s<", string(query))
-	if bytes.Contains(query, []byte("'")) {
-		query = reValues.ReplaceAllLiteral(query, []byte("?"))
-	}
-	//log.Printf("Query is >%s<", string(query))
-	if bytes.Contains(query, []byte("--")) {
-		query = reComments.ReplaceAllLiteral(query, []byte(""))
-	}
-	//log.Printf("Query is >%s<", string(query))
-	query = reMultiSpaces.ReplaceAllLiteral(query, []byte(" "))
-	//log.Printf("Query is >%s<", string(query))
-	query = reNumbers.ReplaceAllLiteral(query, []byte("?"))
-	//log.Printf("Query is >%s<", string(query))
-	//if bytes.Contains(query, []byte("?")) {
-	//	query = reMultiValues.ReplaceAllLiteral(query, []byte("?"))
-	//}
-	//log.Printf("Query is >%s<", string(query))
-
-	return query
-}
-
 func main() {
 
 	flag.BoolVarP(&args.cpuProfile, "cprofile", "", false, "CPU profile this run")
 	flag.BoolVarP(&args.memProfile, "mprofile", "", false, "Memory profile this run")
 	flag.Int32VarP(&args.numReaders, "num-readers", "n", 3, "Read this many files in parallel")
+	flag.BoolVarP(&args.canonicalizeQuery, "canonicalize-query", "c", false, "Canonicalize statements")
+	flag.BoolVarP(&args.tsv, "tsv", "t", false, "Unfold lines and ouput to tsv (usually, for pipe to unix cut)")
 
 	flag.Parse()
 
 	/*  Enable this code for testing specific queries.
-	q2, err := canonicalizeQuery2([]byte(`query to test`))
+	q2, err := canonicalizeQuery([]byte(`query to test`))
 	if err != nil {
 		log.Printf("%s", err)
 	} else {
 		log.Printf("Original: %s\nCanonical: %s\n", q1, q2)
 	}
 	return
-    */
+	*/
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	log.Printf("GOMAXPROCS=%v", runtime.GOMAXPROCS(0))
@@ -276,6 +298,41 @@ Loop:
 	wg.Done()
 }
 
+func logRecord(csvWriter *yacr.Writer, rec CsvLog) (err error) {
+
+	// yacr.csvWriter.writeRecord return a boolean status, unfortunately.
+	errB := csvWriter.WriteRecord(
+		// rec.logTime              time.Time
+		rec.logTimeStr,
+		rec.userName,
+		rec.databaseName,
+		rec.processID,
+		rec.connectionFrom,
+		rec.sessionID,
+		rec.sessionLineNum,
+		rec.commandTag,
+		// rec.sessionStartTime     time.Time
+		rec.sessionStartTimeStr,
+		rec.virtualTransactionID,
+		rec.transactionID,
+		rec.errorSeverity,
+		rec.sqlStateCode,
+		rec.message,
+		rec.detail,
+		rec.hint,
+		rec.internalQuery,
+		rec.internalQueryPos,
+		rec.context,
+		rec.query,
+		rec.queryPos,
+		rec.location,
+		rec.applicationName)
+	if !errB {
+		err = fmt.Errorf("Unable to write output: %v", errB)
+	}
+	return
+}
+
 func parseFile(filename string) (queryCount int, err error) {
 
 	rawReader, err := yopen.NewReader(filename)
@@ -286,32 +343,83 @@ func parseFile(filename string) (queryCount int, err error) {
 	csvReader := yacr.DefaultReader(rawReader)
 	csvWriter := yacr.DefaultWriter(os.Stdout)
 
-	var c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c14b, c15, c16, c17, c18, c19, c20, c21, c22, c23 []byte
+	var cq []byte
 	queryCount = 0
+
+	var incompleteQueries = map[string]CsvLog{}
+
 	for {
 		queryCount++
-		record, err := csvReader.ScanRecord(&c1, &c2, &c3, &c4, &c5, &c6, &c7, &c8, &c9, &c10, &c11, &c12, &c13, &c14, &c15, &c16, &c17, &c18, &c19, &c20, &c21, &c22, &c23)
+		rec := CsvLog{}
+		record, err := csvReader.ScanRecord(
+			// &rec.logTime              time.Time
+			&rec.logTimeStr,
+			&rec.userName,
+			&rec.databaseName,
+			&rec.processID,
+			&rec.connectionFrom,
+			&rec.sessionID,
+			&rec.sessionLineNum,
+			&rec.commandTag,
+			// &rec.sessionStartTime     time.Time
+			&rec.sessionStartTimeStr,
+			&rec.virtualTransactionID,
+			&rec.transactionID,
+			&rec.errorSeverity,
+			&rec.sqlStateCode,
+			&rec.message,
+			&rec.detail,
+			&rec.hint,
+			&rec.internalQuery,
+			&rec.internalQueryPos,
+			&rec.context,
+			&rec.query,
+			&rec.queryPos,
+			&rec.location,
+			&rec.applicationName)
 
 		if err == io.EOF || record == 0 {
 			break
 		}
+
 		if err != nil {
-			log.Fatalf("Error in reading file %s at record %d, line %d: %v",
+			log.Printf("Error at file %s at record %d, line %d: %v",
 				filename, queryCount, csvReader.LineNumber(), err)
-		}
-		//log.Printf("LINE %d >%s< >%s< >%s< >%s< >%s< >%s< >%s< >%s< >%s< >%s< >%s< >%s< >%s< >%s< >%s< >%s< >%s< >%s< >%s< >%s< >%s< >%s< >%s< ", rNum, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16, c17, c18, c19, c20, c21, c22, c23)
-		if len(c14) > 0 {
-			c14b, err = canonicalizeQuery2(c14)
-			if err != nil {
-				log.Printf("ERROR in %s:%d (csv line %d), %v\n%s\nReplacement:%s", filename, csvReader.LineNumber(), queryCount, c14, err, c14b)
-			}
-		} else {
-			c14b = []byte{}
+			continue
 		}
 
-		errB := csvWriter.WriteRecord(c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14b, c15, c16, c17, c18, c19, c20, c21, c22, c23)
-		if !errB {
-			log.Fatalf("Unable to write output: %v", errB)
+		rec.logTime, err = time.Parse(TimeFormat, string(rec.logTimeStr))
+		if err == nil { // err/error is checked later below
+			rec.sessionStartTime, err = time.Parse(TimeFormatNoMillis, string(rec.sessionStartTimeStr))
+			// err/error is checked later below
+		}
+
+		if err != nil {
+			log.Fatalf("Error in reading file %s at record %d, line %d, record:%+v: %v",
+				filename, queryCount, csvReader.LineNumber(), rec, err)
+		}
+
+		hasDuration := bytes.Contains(rec.message, []byte("duration:"))
+		hasStatement := bytes.Contains(rec.message, []byte("statement:"))
+
+		if hasDuration && !hasStatement {
+			if k, ok := incompleteQueries[string(rec.sessionID)]; ok {
+				k.message = append(rec.message, k.message...) // prepend duration
+				rec = k
+			}
+		}
+		if len(rec.message) > 0 && args.canonicalizeQuery {
+			cq, err = canonicalizeQuery(rec.message)
+			if err != nil {
+				log.Printf("ERROR in %s:%d (csv line %d), %v\n%s\nReplacement:%s", filename, csvReader.LineNumber(), queryCount, rec.message, err, cq)
+			} else {
+				rec.message = cq
+			}
+
+		}
+		err = logRecord(csvWriter, rec)
+		if err != nil {
+			log.Fatalf("Unable to write output: %v", err)
 		}
 	}
 	err = rawReader.Close()
