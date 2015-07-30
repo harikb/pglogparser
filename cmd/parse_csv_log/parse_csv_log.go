@@ -17,8 +17,10 @@ import (
 	dprofile "github.com/pkg/profile"
 	"io"
 	"log"
+	"reflect"
 	"regexp"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -28,8 +30,11 @@ type cmdArgs struct {
 	memProfile        bool
 	canonicalizeQuery bool
 	tsv               bool
+	header            bool
+	filterSessionID   string
 	logfilename       string
 	numReaders        int32
+	debug             bool
 }
 
 // these are globals
@@ -83,8 +88,8 @@ CREATE TABLE postgres_log
 
 */
 type CsvLog struct {
-	logTime              time.Time
-	logTimeStr           []byte
+	logTime              time.Time `colName:""`
+	logTimeStr           []byte    `colName:"logTime"`
 	userName             []byte
 	databaseName         []byte
 	processID            []byte
@@ -92,8 +97,8 @@ type CsvLog struct {
 	sessionID            []byte
 	sessionLineNum       []byte
 	commandTag           []byte
-	sessionStartTime     time.Time
-	sessionStartTimeStr  []byte
+	sessionStartTime     time.Time `colName:""`
+	sessionStartTimeStr  []byte    `colName:"sessionStartTime"`
 	virtualTransactionID []byte
 	transactionID        []byte
 	errorSeverity        []byte
@@ -118,7 +123,7 @@ func init() {
 
 }
 
-func canonicalizeQuery(query []byte) (canonicalQuery []byte, err error) {
+func unfoldQuery(query []byte, canonicalize bool) (canonicalQuery []byte, err error) {
 	inQuote := false
 	alreadySubed := false
 	inComment := false
@@ -127,6 +132,7 @@ func canonicalizeQuery(query []byte) (canonicalQuery []byte, err error) {
 	pv := byte(0) // pv == previous v
 	n := byte(0)  // to peek at the next char
 	l := len(query)
+
 	for k, v := range query {
 
 		uv := v // uv stands for unmodified v - since we change with value of v below, setting to zero sometimes.
@@ -142,7 +148,9 @@ func canonicalizeQuery(query []byte) (canonicalQuery []byte, err error) {
 				inQuote = !inQuote // toggle inQuote
 				if !inQuote {
 					alreadySubed = false
-					v = 0 // skip the quote as well
+					if canonicalize {
+						v = 0 // skip the quote as well
+					}
 				}
 			}
 		}
@@ -154,7 +162,7 @@ func canonicalizeQuery(query []byte) (canonicalQuery []byte, err error) {
 				inComment = false
 			}
 		}
-		if inQuote {
+		if inQuote && canonicalize {
 			if !alreadySubed {
 				v = '?'
 				alreadySubed = true
@@ -165,7 +173,7 @@ func canonicalizeQuery(query []byte) (canonicalQuery []byte, err error) {
 		if inComment {
 			v = 0
 		}
-		if v == ' ' || v == '\t' || v == '\v' || v == '\r' || v == '\n' {
+		if !inQuote && (v == ' ' || v == '\t' || v == '\v' || v == '\r' || v == '\n') {
 			if !inSpace {
 				v = ' '
 				inSpace = true
@@ -176,24 +184,28 @@ func canonicalizeQuery(query []byte) (canonicalQuery []byte, err error) {
 			inSpace = false
 		}
 
-		followedByANumber := false
-		if inNumber && n >= '0' && n <= '9' {
-			followedByANumber = true
+		if canonicalize {
+
+			followedByANumber := false
+			if inNumber && n >= '0' && n <= '9' {
+				followedByANumber = true
+			}
+
+			if (v >= '0' && v <= '9') || (inNumber && followedByANumber &&
+				(v == '.' || v == 'e' || v == '+' || v == '-')) {
+				if !inNumber {
+					v = '?'
+					inNumber = true
+				} else {
+					v = 0
+				}
+			} else {
+				inNumber = false
+			}
 		}
 
-		if (v >= '0' && v <= '9') || (inNumber && followedByANumber &&
-			(v == '.' || v == 'e' || v == '+' || v == '-')) {
-			if !inNumber {
-				v = '?'
-				inNumber = true
-			} else {
-				v = 0
-			}
-		} else {
-			inNumber = false
-		}
 		if v != 0 {
-			if v >= 'A' && v <= 'Z' {
+			if canonicalize && v >= 'A' && v <= 'Z' {
 				v += 32 // convert to lower case
 			}
 			canonicalQuery = append(canonicalQuery, v)
@@ -223,6 +235,9 @@ func main() {
 	flag.Int32VarP(&args.numReaders, "num-readers", "n", 3, "Read this many files in parallel")
 	flag.BoolVarP(&args.canonicalizeQuery, "canonicalize-query", "c", false, "Canonicalize statements")
 	flag.BoolVarP(&args.tsv, "tsv", "t", false, "Unfold lines and ouput to tsv (usually, for pipe to unix cut)")
+	flag.BoolVarP(&args.header, "header", "H", false, "Print a line of header")
+	flag.StringVarP(&args.filterSessionID, "filter-session-id", "f", "", "show only queries from this session id")
+	flag.BoolVarP(&args.debug, "debug-print", "", false, "Print with named columns (debugging only)")
 
 	flag.Parse()
 
@@ -298,6 +313,34 @@ Loop:
 	wg.Done()
 }
 
+func logHeader(csvWriter *yacr.Writer, rec CsvLog) (err error) {
+
+	var headers []string
+	var sep = "," // implicit type is rune
+	if args.tsv {
+		sep = "\t"
+	}
+
+	st := reflect.TypeOf(rec)
+	for i := 0; i < st.NumField(); i++ {
+		field := st.Field(i)
+		header := field.Name
+		if field.Tag != "" {
+			header = field.Tag.Get("colName")
+		}
+		if header != "" {
+			headers = append(headers, header)
+		}
+	}
+
+	errB := csvWriter.WriteString(strings.Join(headers, sep))
+	if !errB {
+		err = fmt.Errorf("Unable to write output: %v", errB)
+	}
+
+	return
+}
+
 func logRecord(csvWriter *yacr.Writer, rec CsvLog) (err error) {
 
 	// yacr.csvWriter.writeRecord return a boolean status, unfortunately.
@@ -340,13 +383,18 @@ func parseFile(filename string) (queryCount int, err error) {
 		log.Fatalf("Unable to open file %v: %v", args.logfilename, err)
 	}
 
+	var sep byte = ',' // implicit type is rune
+	if args.tsv {
+		sep = '\t'
+	}
 	csvReader := yacr.DefaultReader(rawReader)
-	csvWriter := yacr.DefaultWriter(os.Stdout)
+	csvWriter := yacr.NewWriter(os.Stdout, sep, true)
 
 	var cq []byte
 	queryCount = 0
 
 	var incompleteQueries = map[string]CsvLog{}
+	headerPrinted := false
 
 	for {
 		queryCount++
@@ -408,20 +456,35 @@ func parseFile(filename string) (queryCount int, err error) {
 				rec = k
 			}
 		}
-		if len(rec.message) > 0 && args.canonicalizeQuery {
-			cq, err = canonicalizeQuery(rec.message)
+
+		if len(rec.message) > 0 && (args.canonicalizeQuery || args.tsv) {
+			cq, err = unfoldQuery(rec.message, args.canonicalizeQuery)
 			if err != nil {
 				log.Printf("ERROR in %s:%d (csv line %d), %v\n%s\nReplacement:%s", filename, csvReader.LineNumber(), queryCount, rec.message, err, cq)
 			} else {
 				rec.message = cq
 			}
-
 		}
-		err = logRecord(csvWriter, rec)
-		if err != nil {
-			log.Fatalf("Unable to write output: %v", err)
+
+		if args.filterSessionID == "" || (args.filterSessionID == string(rec.sessionID)) {
+
+			if args.debug {
+
+				log.Printf("%+v", rec)
+
+			} else {
+				if !headerPrinted {
+					err = logHeader(csvWriter, rec)
+					headerPrinted = true
+				}
+				err = logRecord(csvWriter, rec)
+				if err != nil {
+					log.Fatalf("Unable to write output: %v", err)
+				}
+			}
 		}
 	}
+	csvWriter.Flush()
 	err = rawReader.Close()
 	return
 }
