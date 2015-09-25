@@ -19,8 +19,7 @@ import (
 	"log"
 	"reflect"
 	"regexp"
-	"runtime"
-	"strings"
+	//"strings"
 	"sync"
 	"time"
 )
@@ -232,7 +231,7 @@ func main() {
 
 	flag.BoolVarP(&args.cpuProfile, "cprofile", "", false, "CPU profile this run")
 	flag.BoolVarP(&args.memProfile, "mprofile", "", false, "Memory profile this run")
-	flag.Int32VarP(&args.numReaders, "num-readers", "n", 3, "Read this many files in parallel")
+	flag.Int32VarP(&args.numReaders, "num-readers", "n", 1, "Read this many files in parallel")
 	flag.BoolVarP(&args.canonicalizeQuery, "canonicalize-query", "c", false, "Canonicalize statements")
 	flag.BoolVarP(&args.tsv, "tsv", "t", false, "Unfold lines and ouput to tsv (usually, for pipe to unix cut)")
 	flag.BoolVarP(&args.header, "header", "H", false, "Print a line of header")
@@ -251,9 +250,6 @@ func main() {
 	return
 	*/
 
-	runtime.GOMAXPROCS(runtime.NumCPU())
-	log.Printf("GOMAXPROCS=%v", runtime.GOMAXPROCS(0))
-
 	if args.cpuProfile && args.memProfile {
 		log.Fatalf("Please pass only one of --cprofile or --mprofile")
 	} else if args.cpuProfile {
@@ -268,23 +264,25 @@ func main() {
 	for i := 0; i < int(args.numReaders); i++ {
 		go parseFileWorker(&loaderGroup)
 	}
-	log.Printf("Started %d file loader threads", args.numReaders)
+	//log.Printf("Started %d file loader threads", args.numReaders)
 
 	numFiles := 0
 	for _, filename := range flag.Args() {
 		fileChan <- LogFile{filename}
 		numFiles++
-		if numFiles%20 == 0 {
-			log.Printf("Loaded %d files", numFiles)
-		}
+		/*
+			if numFiles%20 == 0 {
+						log.Printf("Loaded %d files", numFiles)
+					}
+		*/
 	}
 
-	log.Printf("Loaded %d files", numFiles)
-	log.Printf("Closing file channel.")
+	//log.Printf("Loaded %d files", numFiles)
+	//log.Printf("Closing file channel.")
 	close(fileChan)
-	log.Printf("Waiting for loader threads to finish")
+	//log.Printf("Waiting for loader threads to finish")
 	loaderGroup.Wait()
-	log.Printf("All threads completed")
+	//log.Printf("All threads completed")
 
 }
 
@@ -306,20 +304,16 @@ Loop:
 				log.Printf("Unable to parse file %v: %v", f.filename, err)
 			}
 			totalLines += l
-			log.Printf("Worker: %d queries analyzed", totalLines)
+			//log.Printf("Worker: %d queries analyzed", totalLines)
 		}
 	}
-	log.Printf("Ending worker: %d queries analyzed", totalLines)
+	//log.Printf("Ending worker: %d queries analyzed", totalLines)
 	wg.Done()
 }
 
 func logHeader(csvWriter *yacr.Writer, rec CsvLog) (err error) {
 
 	var headers []string
-	var sep = "," // implicit type is rune
-	if args.tsv {
-		sep = "\t"
-	}
 
 	st := reflect.TypeOf(rec)
 	for i := 0; i < st.NumField(); i++ {
@@ -333,7 +327,7 @@ func logHeader(csvWriter *yacr.Writer, rec CsvLog) (err error) {
 		}
 	}
 
-	errB := csvWriter.WriteString(strings.Join(headers, sep))
+	errB := csvWriter.WriteHeader(headers)
 	if !errB {
 		err = fmt.Errorf("Unable to write output: %v", errB)
 	}
